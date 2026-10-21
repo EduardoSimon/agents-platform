@@ -1,3 +1,6 @@
+> Source: https://claude.ai/artifact/Hk2WUaYwrUw12weM1ghME7 · exported 2026-10-21 · revision 91.
+> This copy is what ADRs and issues link to. Design changes go through an ADR first, then a re-export of the spec.
+
 # Agents Platform — Spec v0.1
 
 Oct 18, 2026 · @Gabby
