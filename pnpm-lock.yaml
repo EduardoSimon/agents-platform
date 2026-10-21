@@ -188,6 +188,12 @@ importers:
         specifier: 3.2.7
         version: 3.2.7(@types/node@24.0.0)
 
+  packages/sample:
+    dependencies:
+      effect:
+        specifier: 3.22.3
+        version: 3.22.3
+
 packages:
 
   '@biomejs/biome@2.5.15':
