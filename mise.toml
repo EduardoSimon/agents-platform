@@ -10,3 +10,41 @@ lima = "2.2.1"
 [env]
 # The mise pin is the only Go version; never download another toolchain.
 GOTOOLCHAIN = "local"
+
+[tasks.format]
+description = "Write formatting for TypeScript (Biome) and Go (gofmt)"
+run = ["pnpm exec biome format --write .", "gofmt -w apps/egress"]
+
+[tasks."format:check"]
+description = "Fail if any TypeScript or Go file is not formatted"
+run = [
+  "pnpm exec biome format .",
+  "test -z \"$(gofmt -l apps/egress)\" || { gofmt -l apps/egress; exit 1; }"
+]
+
+[tasks.lint]
+description = "Biome lint and go vet"
+run = ["pnpm exec biome lint .", "go -C apps/egress vet ./..."]
+
+[tasks.typecheck]
+description = "tsc -b over the root project references"
+run = "pnpm exec tsc -b"
+
+[tasks.test]
+description = "Vitest and go test"
+run = ["pnpm exec vitest run", "go -C apps/egress test ./..."]
+
+[tasks.build]
+description = "Each package's own build, then go build"
+run = ["pnpm -r --if-present run build", "go -C apps/egress build ./..."]
+
+# Steps run one after another: low memory next to the Lima VM, readable output.
+[tasks.check]
+description = "format:check, lint, typecheck, test and build; fails if any one fails"
+run = [
+  { task = "format:check" },
+  { task = "lint" },
+  { task = "typecheck" },
+  { task = "test" },
+  { task = "build" }
+]
