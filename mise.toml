@@ -1,0 +1,12 @@
+[tools]
+node = "24.22.0"
+pnpm = "12.14.0"
+go = "1.27.2"
+kubectl = "1.37.1"
+argocd = "3.5.5"
+opentofu = "1.13.1"
+lima = "2.2.1"
+
+[env]
+# The mise pin is the only Go version; never download another toolchain.
+GOTOOLCHAIN = "local"
