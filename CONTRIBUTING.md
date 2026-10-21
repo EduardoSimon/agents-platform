@@ -31,10 +31,10 @@ mise run check
 
 ## Conventions
 
-- **Coding standards:** TypeScript follows the seven rules in [Coding standards in Effect](docs/spec.md#coding-standards-in-effect). Merging this PR signs off on them.
+- **Coding standards:** TypeScript follows the seven rules in [Coding standards in Effect](docs/spec.md#coding-standards-in-effect). These rules are agreed.
 - **Tooling:** Biome is the only formatter and linter for TypeScript. It replaces the `@effect/eslint-plugin` named in the spec; the Effect language service runs in the editor. `gofmt` and `go vet` cover Go.
 - **Effect version:** `effect` and every `@effect/*` package stay on one matched release set (3.x, the version the standards are written for). Moving to a new Effect major needs an ADR.
 - **Types and build:** `typecheck` is the root `tsc -b`. Each package owns its `build` script, so bundling for `images/` can be added without touching `check`.
-- **New packages:** copy `packages/sample`. Its `exports` use a `source` condition (`src/index.ts`), with `dist` as the default, so tests and types work on a clean clone without a build.
+- **New packages:** copy `packages/sample`. Its `exports` use an `@agents-platform/source` condition (`src/index.ts`), with `dist` as the default, so tests and types work on a clean clone without a build.
 - **Go:** one module, `apps/egress`, run with `go -C apps/egress …`. There is no `go.work`. `GOTOOLCHAIN=local` keeps the mise pin as the only Go version.
 - **Examples:** `examples/*` are standalone projects with their own lockfiles and are not part of `check`.

@@ -1,8 +1,8 @@
 import { defineConfig } from "vitest/config"
 
-// "source" resolves workspace packages to their src/, so tests run without a prior build.
+// "@agents-platform/source" resolves workspace packages to their src/, so tests run without a prior build.
 export default defineConfig({
-  resolve: { conditions: ["source"] },
+  resolve: { conditions: ["@agents-platform/source"] },
   test: {
     projects: [
       {

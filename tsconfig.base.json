@@ -4,7 +4,7 @@
     "lib": ["ES2023"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "customConditions": ["source"],
+    "customConditions": ["@agents-platform/source"],
     "types": ["node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
