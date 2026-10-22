@@ -15,6 +15,7 @@ export const startServer = async (options: {
   readonly token: string
   readonly workspaceDir: string
   readonly port: number
+  readonly sshPort?: number
 }): Promise<RunningServer> => {
   const layer = SandboxdApp.pipe(
     Layer.provideMerge(
@@ -24,7 +25,10 @@ export const startServer = async (options: {
       Layer.succeed(SandboxdConfig, {
         token: Redacted.make(options.token),
         workspaceDir: options.workspaceDir,
-        port: options.port
+        port: options.port,
+        previewUrlTemplate: "https://{port}-{session}.preview.local",
+        sessionId: "test",
+        sshPort: options.sshPort ?? 22
       })
     )
   )

@@ -9,6 +9,8 @@ import {
   ToolIoError
 } from "./errors.js"
 import { runProcess } from "./process.js"
+import { Presence } from "./presence.js"
+import { ProcessInfo, ProcessName, Processes } from "./processes.js"
 import { type AnyTool, defineTool } from "./registry.js"
 import { Workspace } from "./workspace.js"
 
@@ -226,4 +228,78 @@ const safeJson = (line: string): unknown => {
   }
 }
 
-export const tools: ReadonlyArray<AnyTool> = [exec, read, write, edit, list, globTool, grep]
+const processStart = defineTool({
+  name: "process.start",
+  description:
+    "Start a long-running service in the workspace. It keeps running between calls, logs to .sandbox/logs/<name>.log, and is started again when sandboxd restarts.",
+  input: {
+    name: ProcessName,
+    command: Schema.String,
+    cwd: Schema.optional(Schema.String),
+    env: Schema.optional(Schema.Record({ key: Schema.String, value: Schema.String }))
+  },
+  output: ProcessInfo,
+  handler: ({ name, command, cwd, env }) =>
+    Effect.flatMap(Processes, (processes) =>
+      processes.start({ name, command, cwd: cwd ?? ".", env: env ?? {} })
+    )
+})
+
+const processStop = defineTool({
+  name: "process.stop",
+  description: "Stop a service (its whole process group) and remove it from the services manifest.",
+  input: { name: Schema.String },
+  output: Schema.Struct({ name: Schema.String }),
+  handler: ({ name }) => Effect.flatMap(Processes, (processes) => processes.stop(name))
+})
+
+const processList = defineTool({
+  name: "process.list",
+  description: "List services with their status, pid, exit code or start failure.",
+  input: {},
+  output: Schema.Struct({ processes: Schema.Array(ProcessInfo) }),
+  handler: () =>
+    Effect.flatMap(Processes, (processes) =>
+      Effect.map(processes.list, (list) => ({ processes: list }))
+    )
+})
+
+const processLogs = defineTool({
+  name: "process.logs",
+  description:
+    "Read a service log: the last `tail` lines (default 100), or everything after byte offset `since`. Returns the next offset.",
+  input: {
+    name: Schema.String,
+    tail: Schema.optional(Schema.Int.pipe(Schema.between(1, 10_000))),
+    since: Schema.optional(Schema.Int.pipe(Schema.nonNegative()))
+  },
+  output: Schema.Struct({ content: Schema.String, offset: Schema.Int }),
+  handler: ({ name, tail, since }) =>
+    Effect.flatMap(Processes, (processes) => processes.logs(name, { tail, since }))
+})
+
+const previewExpose = defineTool({
+  name: "preview.expose",
+  description: "Register a local port for preview and return its preview URL.",
+  input: { port: Schema.Int.pipe(Schema.between(1, 65_535)) },
+  output: Schema.Struct({ port: Schema.Int, url: Schema.String }),
+  handler: ({ port }) =>
+    Effect.flatMap(Presence, (presence) =>
+      Effect.map(presence.expose(port), (url) => ({ port, url }))
+    )
+})
+
+export const tools: ReadonlyArray<AnyTool> = [
+  exec,
+  read,
+  write,
+  edit,
+  list,
+  globTool,
+  grep,
+  processStart,
+  processStop,
+  processList,
+  processLogs,
+  previewExpose
+]
