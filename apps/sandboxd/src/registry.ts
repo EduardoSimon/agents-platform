@@ -2,9 +2,11 @@ import { Schema } from "effect"
 import type { Effect } from "effect"
 import type { CallCache } from "./call-cache.js"
 import type { ToolError } from "./errors.js"
+import type { Presence } from "./presence.js"
+import type { Processes } from "./processes.js"
 import type { Workspace } from "./workspace.js"
 
-export type ToolRequirements = Workspace
+export type ToolRequirements = Workspace | Processes | Presence
 
 export interface ToolDefinition<I extends Schema.Struct.Fields, O extends Schema.Schema.Any> {
   readonly name: string

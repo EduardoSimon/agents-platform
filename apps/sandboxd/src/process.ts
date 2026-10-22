@@ -20,7 +20,7 @@ export interface RunResult {
 const TRUNCATED = "\n[output truncated]"
 
 /** Never hand the daemon's own credentials to a command the agent runs. */
-const childEnv = (): NodeJS.ProcessEnv => {
+export const childEnv = (): NodeJS.ProcessEnv => {
   const { SANDBOXD_TOKEN: _token, ...rest } = process.env
   return rest
 }
