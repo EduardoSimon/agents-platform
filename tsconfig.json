@@ -1,4 +1,4 @@
 {
   "files": [],
-  "references": [{ "path": "packages/sample" }]
+  "references": [{ "path": "packages/sample" }, { "path": "apps/sandboxd" }]
 }

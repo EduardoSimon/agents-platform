@@ -1,0 +1,27 @@
+{
+  "name": "@agents-platform/sandboxd",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "@agents-platform/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@effect/ai": "0.37.0",
+    "@effect/experimental": "0.61.0",
+    "@effect/platform": "0.97.2",
+    "@effect/platform-node": "0.108.3",
+    "@effect/rpc": "0.76.3",
+    "effect": "3.22.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1"
+  }
+}
