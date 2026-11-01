@@ -248,7 +248,7 @@ const processStart = defineTool({
 const processStop = defineTool({
   name: "process.stop",
   description: "Stop a service (its whole process group) and remove it from the services manifest.",
-  input: { name: Schema.String },
+  input: { name: ProcessName },
   output: Schema.Struct({ name: Schema.String }),
   handler: ({ name }) => Effect.flatMap(Processes, (processes) => processes.stop(name))
 })
@@ -269,7 +269,7 @@ const processLogs = defineTool({
   description:
     "Read a service log: the last `tail` lines (default 100), or everything after byte offset `since`. Returns the next offset.",
   input: {
-    name: Schema.String,
+    name: ProcessName,
     tail: Schema.optional(Schema.Int.pipe(Schema.between(1, 10_000))),
     since: Schema.optional(Schema.Int.pipe(Schema.nonNegative()))
   },

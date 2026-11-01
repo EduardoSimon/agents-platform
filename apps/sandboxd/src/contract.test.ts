@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { spawn } from "node:child_process"
+import { basename, join } from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
@@ -112,6 +113,15 @@ const until = async (check: () => Promise<boolean>) => {
 const isAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const groupAlive = (pgid: number): boolean => {
+  try {
+    process.kill(-pgid, 0)
     return true
   } catch {
     return false
@@ -319,6 +329,44 @@ describe.each(["json", "mcp"] as const)("contract: %s transport", (name) => {
     }
   })
 
+  it("rejects process names that leave the logs directory", async () => {
+    const a = adapter()
+    const outside = await mkdtemp(join(tmpdir(), "sandboxd-out-"))
+    await writeFile(join(outside, "secret.log"), "SECRET-OUTSIDE\n")
+    try {
+      const outsideName = `../../../${basename(outside)}/secret`
+      const logs = await a.call("process.logs", { name: outsideName })
+      expect(logs).toMatchObject({ ok: false })
+      expect(JSON.stringify(logs)).not.toContain("SECRET")
+      const stopped = await a.call("process.stop", { name: "../x" })
+      expect(stopped).toMatchObject({ ok: false })
+      expect((stopped as { tag?: string }).tag).not.toBe("ProcessNotFound")
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it("reports a signal exit as 128 + signo", async () => {
+    const a = adapter()
+    const svc = `sig-${name}`
+    try {
+      await a.call("process.start", { name: svc, command: "kill -TERM $$" })
+      await until(async () => {
+        const out = (await a.call("process.list", {})) as {
+          value: { processes: Array<{ name: string; status: string }> }
+        }
+        return out.value.processes.find((p) => p.name === svc)?.status === "exited"
+      })
+      expect(await a.call("process.list", {})).toMatchObject({
+        value: {
+          processes: expect.arrayContaining([expect.objectContaining({ name: svc, exitCode: 143 })])
+        }
+      })
+    } finally {
+      await a.call("process.stop", { name: svc })
+    }
+  })
+
   it("exposes a preview URL", async () => {
     expect(await adapter().call("preview.expose", { port: 5173 })).toEqual({
       ok: true,
@@ -424,6 +472,47 @@ describe("restart", () => {
     } finally {
       for (const svc of ["svc", "broken", "quick"]) {
         await jsonAdapter(running.url).call("process.stop", { name: svc })
+      }
+      await running.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("kills a service left behind by a crashed daemon before starting it again", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-crash-"))
+    const command = "echo boot >> boots.txt; sleep 60"
+    // What a SIGKILLed daemon leaves behind: a detached group still running, recorded in the manifest.
+    const orphan = spawn("sh", ["-c", command], { cwd: dir, detached: true, stdio: "ignore" })
+    orphan.unref()
+    const oldPid = orphan.pid as number
+    await mkdir(join(dir, ".sandbox"), { recursive: true })
+    await writeFile(
+      join(dir, ".sandbox/services.json"),
+      JSON.stringify([{ name: "svc", command, cwd: ".", env: {}, pid: oldPid, pgid: oldPid }])
+    )
+    await until(async () => (await readFile(join(dir, "boots.txt"), "utf8").catch(() => "")) !== "")
+    const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+    try {
+      const api = jsonAdapter(running.url)
+      expect(isAlive(oldPid)).toBe(false)
+      const listed = (await api.call("process.list", {})) as {
+        value: { processes: Array<{ name: string; status: string; pid: number }> }
+      }
+      expect(listed.value.processes).toMatchObject([{ name: "svc", status: "running" }])
+      const newPid = listed.value.processes[0]?.pid as number
+      expect(newPid).not.toBe(oldPid)
+      const manifest = JSON.parse(await readFile(join(dir, ".sandbox/services.json"), "utf8"))
+      expect(manifest).toMatchObject([{ name: "svc", pid: newPid, pgid: newPid }])
+      expect(await api.call("process.stop", { name: "svc" })).toMatchObject({ ok: true })
+      expect(isAlive(oldPid)).toBe(false)
+      expect(isAlive(newPid)).toBe(false)
+      expect(groupAlive(oldPid)).toBe(false)
+      expect(groupAlive(newPid)).toBe(false)
+    } finally {
+      try {
+        process.kill(-oldPid, "SIGKILL")
+      } catch {
+        // already gone
       }
       await running.stop()
       await rm(dir, { recursive: true, force: true })

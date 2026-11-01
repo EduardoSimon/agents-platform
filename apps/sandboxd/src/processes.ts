@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process"
 import { closeSync, openSync } from "node:fs"
 import { mkdir, open, readFile, rename, writeFile } from "node:fs/promises"
+import { constants } from "node:os"
 import { join } from "node:path"
 import { Context, Effect, Layer, Option, Schema } from "effect"
 import { ProcessAlreadyRunning, ProcessNotFound, type ToolError, ToolIoError } from "./errors.js"
@@ -21,6 +22,13 @@ export const ServiceSpec = Schema.Struct({
   env: Schema.Record({ key: Schema.String, value: Schema.String })
 })
 export type ServiceSpec = typeof ServiceSpec.Type
+
+/** A manifest entry: the spec plus the process group that was running it, if any. */
+const ManifestEntry = Schema.Struct({
+  ...ServiceSpec.fields,
+  pid: Schema.optional(Schema.Int),
+  pgid: Schema.optional(Schema.Int)
+})
 
 export const ProcessInfo = Schema.Struct({
   name: Schema.String,
@@ -75,16 +83,42 @@ const info = (entry: Entry): ProcessInfo => ({
   ...(entry.error === undefined ? {} : { error: entry.error })
 })
 
-const killGroup = (entry: Entry, signal: NodeJS.Signals) => {
-  if (entry.pid === undefined) return
+const signalGroup = (pgid: number, signal: NodeJS.Signals | 0): boolean => {
   try {
-    process.kill(-entry.pid, signal)
+    process.kill(-pgid, signal)
+    return true
   } catch {
     // group already gone
+    return false
   }
 }
 
+const killGroup = (entry: Entry, signal: NodeJS.Signals) => {
+  if (entry.pid !== undefined) signalGroup(entry.pid, signal)
+}
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Kill a group a previous daemon left running (it crashed before stopping it). It is not our child,
+ * so poll for it to go away instead of waiting on an exit event.
+ */
+const reapOrphan = async (pgid: number) => {
+  const gone = async () => {
+    for (let waited = 0; waited < STOP_GRACE_MS; waited += 50) {
+      if (!signalGroup(pgid, 0)) return
+      await sleep(50)
+    }
+  }
+  if (!signalGroup(pgid, "SIGTERM")) return
+  await gone()
+  signalGroup(pgid, "SIGKILL")
+  await gone()
+}
+
+/** Shell convention: a signal exit is 128 + the signal number. */
+const exitCodeOf = (code: number | null, signal: NodeJS.Signals | null): number =>
+  code ?? (signal === null ? -1 : 128 + (constants.signals[signal] ?? 0))
 
 /** SIGTERM the group, wait for the shell, then SIGKILL whatever is left. */
 const terminate = async (entry: Entry) => {
@@ -97,7 +131,7 @@ const terminate = async (entry: Entry) => {
 const failureMessage = (error: ToolError): string =>
   error._tag === "ToolIoError" ? error.message : error._tag
 
-const decodeManifest = Schema.decodeUnknownOption(Schema.Array(ServiceSpec))
+const decodeManifest = Schema.decodeUnknownOption(Schema.Array(ManifestEntry))
 
 export const ProcessesLive = Layer.scoped(
   Processes,
@@ -120,7 +154,10 @@ export const ProcessesLive = Layer.scoped(
 
     /** Atomic: write a sibling temp file, then rename over the manifest. */
     const persist = io("services manifest", async () => {
-      const specs = [...entries.values()].map((entry) => entry.spec)
+      // The pid is also the pgid: services are spawned detached, as their own group leader.
+      const specs = [...entries.values()].map(({ spec, pid }) =>
+        pid === undefined ? spec : { ...spec, pid, pgid: pid }
+      )
       await mkdir(sandboxDir, { recursive: true })
       const temp = `${manifestPath}.${process.pid}.tmp`
       await writeFile(temp, `${JSON.stringify(specs, null, 2)}\n`, "utf8")
@@ -166,7 +203,7 @@ export const ProcessesLive = Layer.scoped(
           })
           child.once("exit", (code, signal) => {
             if (entry.status === "running") entry.status = "exited"
-            entry.exitCode = code ?? (signal === null ? -1 : 128)
+            entry.exitCode = exitCodeOf(code, signal)
             resolve()
           })
         })
@@ -177,9 +214,11 @@ export const ProcessesLive = Layer.scoped(
     // Boot: start every service from the manifest. One bad service must not stop the daemon.
     const manifest = yield* Effect.tryPromise(() => readFile(manifestPath, "utf8")).pipe(
       Effect.map((text) => decodeManifest(safeJson(text))),
-      Effect.orElseSucceed(() => Option.none<ReadonlyArray<ServiceSpec>>())
+      Effect.orElseSucceed(() => Option.none<ReadonlyArray<typeof ManifestEntry.Type>>())
     )
-    for (const spec of Option.getOrElse(manifest, () => [])) {
+    for (const { pid: _pid, pgid, ...spec } of Option.getOrElse(manifest, () => [])) {
+      // After a crash the old group is still running: kill it so only the relaunched copy is left.
+      if (pgid !== undefined) yield* Effect.promise(() => reapOrphan(pgid))
       const entry = yield* launch(spec).pipe(
         Effect.catchAll((error) =>
           Effect.succeed<Entry>({
@@ -193,6 +232,8 @@ export const ProcessesLive = Layer.scoped(
       )
       entries.set(spec.name, entry)
     }
+    // Record the new pids, so a later crash can be cleaned up too.
+    if (entries.size > 0) yield* persist.pipe(Effect.ignore)
 
     // Closing the server layer stops the children but keeps the manifest, so the next boot restores them.
     yield* Effect.addFinalizer(() =>
