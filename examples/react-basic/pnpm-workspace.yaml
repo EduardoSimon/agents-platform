@@ -1,0 +1,3 @@
+# Its own workspace root: keeps this example out of the repo's pnpm workspace.
+allowBuilds:
+  esbuild: false

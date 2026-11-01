@@ -1,0 +1,10 @@
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+apps/egress
+deploy
+docs
+examples
+images
+infra
