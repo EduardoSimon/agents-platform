@@ -175,6 +175,9 @@ importers:
       '@effect/vitest':
         specifier: 0.30.0
         version: 0.30.0(effect@3.22.3)(vitest@3.2.7(@types/node@24.0.0))
+      '@modelcontextprotocol/sdk':
+        specifier: 1.32.1
+        version: 1.32.1(zod@4.6.7)
       '@types/node':
         specifier: 24.0.0
         version: 24.0.0

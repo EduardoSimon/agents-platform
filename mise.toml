@@ -48,3 +48,12 @@ run = [
   { task = "test" },
   { task = "build" }
 ]
+
+# Needs Docker. Not part of `check`: it builds an image and runs a container.
+[tasks."sandbox:smoke"]
+description = "Build the sandbox image and run the container smoke test against it"
+run = [
+  "docker build --file images/sandbox/Dockerfile --tag agents-platform/sandbox:dev .",
+  "pnpm exec tsc -p images/sandbox",
+  "pnpm exec vitest run --config images/sandbox/vitest.config.ts"
+]
