@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process"
 import { readdir, readFile } from "node:fs/promises"
 import { join, relative } from "node:path"
-import { promisify } from "node:util"
+import { promisify, stripVTControlCharacters } from "node:util"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js"
@@ -149,6 +149,7 @@ describe("sandbox image", () => {
     }
     const result = await exec("pnpm install --frozen-lockfile && pnpm test", "react-basic")
     expect(result, result.stdout + result.stderr).toMatchObject({ exitCode: 0, timedOut: false })
+    expect(stripVTControlCharacters(result.stdout)).toMatch(/Tests\s+1 passed/)
   }, 660_000)
 
   it("starts pnpm dev again after a container restart", async () => {
