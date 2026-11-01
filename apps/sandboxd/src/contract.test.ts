@@ -1,14 +1,29 @@
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { spawn } from "node:child_process"
+import { basename, join } from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { leaderIdentity } from "./processes.js"
 import { type RunningServer, startServer } from "./testing.js"
 
 const TOKEN = "test-token"
-const TOOLS = ["exec", "fs.edit", "fs.glob", "fs.grep", "fs.list", "fs.read", "fs.write"]
+const TOOLS = [
+  "exec",
+  "fs.edit",
+  "fs.glob",
+  "fs.grep",
+  "fs.list",
+  "fs.read",
+  "fs.write",
+  "preview.expose",
+  "process.list",
+  "process.logs",
+  "process.start",
+  "process.stop"
+]
 
 type Outcome =
   | { readonly ok: true; readonly value: unknown }
@@ -86,6 +101,43 @@ const mcpAdapter = (url: string): Adapter => {
       }
     }
   }
+}
+
+const until = async (check: () => Promise<boolean>) => {
+  for (let i = 0; i < 100; i++) {
+    if (await check()) return
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  throw new Error("condition not met in time")
+}
+
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const groupAlive = (pgid: number): boolean => {
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const waitForPort = async (adapter: Adapter, name: string): Promise<number> => {
+  let port = 0
+  await until(async () => {
+    const out = await adapter.call("process.logs", { name })
+    const match = /port=(\d+)/.exec((out as { value?: { content?: string } }).value?.content ?? "")
+    port = Number(match?.[1] ?? 0)
+    return port > 0
+  })
+  return port
 }
 
 let server: RunningServer
@@ -204,6 +256,126 @@ describe.each(["json", "mcp"] as const)("contract: %s transport", (name) => {
     await rm(outside, { recursive: true, force: true })
   })
 
+  it("keeps a process running between calls, then stops it", async () => {
+    const a = adapter()
+    const svc = `web-${name}`
+    const command = `node -e "require('http').createServer((q,r)=>r.end('hi')).listen(0,'127.0.0.1',function(){console.log('port='+this.address().port)});setInterval(()=>{},1000)"`
+    try {
+      const started = await a.call("process.start", { name: svc, command })
+      expect(started).toMatchObject({ ok: true, value: { name: svc, status: "running" } })
+      const pid = (started as { value: { pid: number } }).value.pid
+      const listed = await a.call("process.list", {})
+      expect(listed).toMatchObject({ ok: true, value: { processes: [{ name: svc, pid }] } })
+      const port = await waitForPort(a, svc)
+      expect(await (await fetch(`http://127.0.0.1:${port}`)).text()).toBe("hi")
+      // A later call still sees it running.
+      expect(await a.call("process.list", {})).toMatchObject({
+        value: { processes: [{ name: svc, status: "running" }] }
+      })
+      expect(await a.call("process.logs", { name: svc, tail: 1 })).toMatchObject({
+        ok: true,
+        value: { content: `port=${port}\n` }
+      })
+      expect(await a.call("process.start", { name: svc, command: "sleep 1" })).toMatchObject({
+        ok: false,
+        tag: "ProcessAlreadyRunning"
+      })
+      expect(await a.call("process.stop", { name: svc })).toMatchObject({
+        ok: true,
+        value: { name: svc }
+      })
+      expect(isAlive(pid)).toBe(false)
+      expect(await a.call("process.list", {})).toMatchObject({
+        ok: true,
+        value: { processes: [] }
+      })
+      expect(await a.call("process.stop", { name: svc })).toMatchObject({
+        ok: false,
+        tag: "ProcessNotFound"
+      })
+    } finally {
+      await a.call("process.stop", { name: svc })
+    }
+  })
+
+  it("reads logs after an offset and records a failed start", async () => {
+    const a = adapter()
+    const svc = `logs-${name}`
+    try {
+      await a.call("process.start", { name: svc, command: "echo one; echo two; sleep 30" })
+      let first: { content: string; offset: number } | undefined
+      await until(async () => {
+        const out = await a.call("process.logs", { name: svc })
+        first = (out as { value: { content: string; offset: number } }).value
+        return first.content === "one\ntwo\n"
+      })
+      expect(first?.offset).toBe(8)
+      expect(await a.call("process.logs", { name: svc, since: 4 })).toMatchObject({
+        value: { content: "two\n", offset: 8 }
+      })
+      expect(await a.call("process.logs", { name: "missing" })).toMatchObject({
+        ok: false,
+        tag: "ProcessNotFound"
+      })
+      expect(
+        await a.call("process.start", {
+          name: `bad-${name}`,
+          command: "true",
+          cwd: "nowhere/at/all"
+        })
+      ).toMatchObject({ ok: true, value: { status: "failed" } })
+    } finally {
+      await a.call("process.stop", { name: svc })
+      await a.call("process.stop", { name: `bad-${name}` })
+    }
+  })
+
+  it("rejects process names that leave the logs directory", async () => {
+    const a = adapter()
+    const outside = await mkdtemp(join(tmpdir(), "sandboxd-out-"))
+    await writeFile(join(outside, "secret.log"), "SECRET-OUTSIDE\n")
+    try {
+      const outsideName = `../../../${basename(outside)}/secret`
+      const logs = await a.call("process.logs", { name: outsideName })
+      expect(logs).toMatchObject({ ok: false })
+      expect(JSON.stringify(logs)).not.toContain("SECRET")
+      const stopped = await a.call("process.stop", { name: "../x" })
+      expect(stopped).toMatchObject({ ok: false })
+      expect((stopped as { tag?: string }).tag).not.toBe("ProcessNotFound")
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it("reports a signal exit as 128 + signo", async () => {
+    const a = adapter()
+    const svc = `sig-${name}`
+    try {
+      await a.call("process.start", { name: svc, command: "kill -TERM $$" })
+      await until(async () => {
+        const out = (await a.call("process.list", {})) as {
+          value: { processes: Array<{ name: string; status: string }> }
+        }
+        return out.value.processes.find((p) => p.name === svc)?.status === "exited"
+      })
+      expect(await a.call("process.list", {})).toMatchObject({
+        value: {
+          processes: expect.arrayContaining([expect.objectContaining({ name: svc, exitCode: 143 })])
+        }
+      })
+    } finally {
+      await a.call("process.stop", { name: svc })
+    }
+  })
+
+  it("exposes a preview URL", async () => {
+    expect(await adapter().call("preview.expose", { port: 5173 })).toEqual({
+      ok: true,
+      value: { port: 5173, url: "https://5173-test.preview.local" }
+    })
+    expect(await adapter().call("preview.expose", { port: 0 })).toMatchObject({ ok: false })
+  })
+
   it("answers 401 without a valid token", async () => {
     const a = adapter()
     expect(await a.call("fs.list", { path: "." }, null)).toMatchObject({ ok: false, status: 401 })
@@ -229,6 +401,206 @@ describe("contract: transports agree", () => {
     for (const [tool, input] of calls) {
       const [a, b] = [await json.call(tool, input), await mcp.call(tool, input)]
       expect(b, tool).toEqual(a.ok ? a : { ...a, status: 200 })
+    }
+  })
+})
+
+describe("presence", () => {
+  it("is bearer-protected and reports counters", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-presence-"))
+    const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0, sshPort: 1 })
+    try {
+      const get = (token?: string) =>
+        fetch(`${running.url}/v1/presence`, {
+          headers: token === undefined ? {} : { authorization: `Bearer ${token}` }
+        })
+      expect((await get()).status).toBe(401)
+      expect(await (await get(TOKEN)).json()).toEqual({
+        sshConnections: 0,
+        previewLastActivityAt: null
+      })
+      await jsonAdapter(running.url).call("preview.expose", { port: 3000 })
+      const body = (await (await get(TOKEN)).json()) as { previewLastActivityAt: string }
+      expect(Number.isNaN(Date.parse(body.previewLastActivityAt))).toBe(false)
+    } finally {
+      await running.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("restart", () => {
+  it("starts services from the manifest again over the same workspace", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-restart-"))
+    let running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+    try {
+      let api = jsonAdapter(running.url)
+      const first = await api.call("process.start", {
+        name: "svc",
+        command: "echo boot >> boots.txt; sleep 60"
+      })
+      await api.call("process.start", { name: "gone", command: "sleep 60" })
+      await api.call("process.stop", { name: "gone" })
+      await api.call("process.start", { name: "broken", command: "true", cwd: "x" })
+      await api.call("process.start", { name: "quick", command: "exit 3" })
+      const oldPid = (first as { value: { pid: number } }).value.pid
+      await running.stop()
+      expect(isAlive(oldPid)).toBe(false)
+      const manifest = JSON.parse(await readFile(join(dir, ".sandbox/services.json"), "utf8"))
+      expect(manifest.map((s: { name: string }) => s.name).sort()).toEqual([
+        "broken",
+        "quick",
+        "svc"
+      ])
+
+      running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+      api = jsonAdapter(running.url)
+      const listed = (await api.call("process.list", {})) as {
+        value: { processes: Array<{ name: string; status: string; pid?: number }> }
+      }
+      const byName = Object.fromEntries(listed.value.processes.map((p) => [p.name, p]))
+      expect(Object.keys(byName).sort()).toEqual(["broken", "quick", "svc"])
+      expect(byName.svc?.status).toBe("running")
+      expect(byName.svc?.pid).not.toBe(oldPid)
+      expect(byName.broken?.status).toBe("failed")
+      await until(async () => {
+        const again = (await api.call("process.list", {})) as typeof listed
+        return again.value.processes.find((p) => p.name === "quick")?.status === "exited"
+      })
+      await until(
+        async () => (await readFile(join(dir, "boots.txt"), "utf8")).split("\n").length === 3
+      )
+    } finally {
+      for (const svc of ["svc", "broken", "quick"]) {
+        await jsonAdapter(running.url).call("process.stop", { name: svc })
+      }
+      await running.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ["a plain command", "echo boot >> boots.txt; sleep 60"],
+    // The leader execs into another program after its identity is recorded.
+    ["an exec command", "echo boot >> boots.txt; sleep 0.2; exec sleep 60"]
+  ])("kills a service left behind by a crashed daemon running %s", async (_, command) => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-crash-"))
+    // What a SIGKILLed daemon leaves behind: a detached group still running, recorded in the manifest
+    // with its leader's identity. Spawned the way sandboxd spawns services.
+    const orphan = spawn("sh", ["-c", command], { cwd: dir, detached: true, stdio: "ignore" })
+    orphan.unref()
+    const oldPid = orphan.pid as number
+    const leader = await leaderIdentity(oldPid)
+    expect(leader).toBeDefined()
+    await mkdir(join(dir, ".sandbox"), { recursive: true })
+    await writeFile(
+      join(dir, ".sandbox/services.json"),
+      JSON.stringify([
+        { name: "svc", command, cwd: ".", env: {}, pid: oldPid, pgid: oldPid, leader }
+      ])
+    )
+    await until(async () => (await readFile(join(dir, "boots.txt"), "utf8").catch(() => "")) !== "")
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+    try {
+      const api = jsonAdapter(running.url)
+      expect(isAlive(oldPid)).toBe(false)
+      const listed = (await api.call("process.list", {})) as {
+        value: { processes: Array<{ name: string; status: string; pid: number }> }
+      }
+      expect(listed.value.processes).toMatchObject([{ name: "svc", status: "running" }])
+      const newPid = listed.value.processes[0]?.pid as number
+      expect(newPid).not.toBe(oldPid)
+      // Exactly one copy: the orphan's group is gone and only the relaunched one runs.
+      expect(groupAlive(oldPid)).toBe(false)
+      expect(groupAlive(newPid)).toBe(true)
+      await until(
+        async () => (await readFile(join(dir, "boots.txt"), "utf8")).split("\n").length === 3
+      )
+      const manifest = JSON.parse(await readFile(join(dir, ".sandbox/services.json"), "utf8"))
+      expect(manifest).toMatchObject([
+        { name: "svc", pid: newPid, pgid: newPid, leader: await leaderIdentity(newPid) }
+      ])
+      expect(await api.call("process.stop", { name: "svc" })).toMatchObject({ ok: true })
+      expect(isAlive(oldPid)).toBe(false)
+      expect(isAlive(newPid)).toBe(false)
+      expect(groupAlive(oldPid)).toBe(false)
+      expect(groupAlive(newPid)).toBe(false)
+    } finally {
+      try {
+        process.kill(-oldPid, "SIGKILL")
+      } catch {
+        // already gone
+      }
+      await running.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("leaves alone an unrelated group that now holds the recorded pgid", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-reuse-"))
+    // The recorded group died and the OS gave its pgid to an unrelated group leader.
+    const victim = spawn("sleep", ["60"], { detached: true, stdio: "ignore" })
+    victim.unref()
+    const victimPid = victim.pid as number
+    await mkdir(join(dir, ".sandbox"), { recursive: true })
+    await writeFile(
+      join(dir, ".sandbox/services.json"),
+      JSON.stringify([
+        {
+          name: "svc",
+          command: "sleep 60",
+          cwd: ".",
+          env: {},
+          pid: victimPid,
+          pgid: victimPid,
+          leader: "a leader that no longer exists"
+        }
+      ])
+    )
+    const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+    try {
+      expect(groupAlive(victimPid)).toBe(true)
+      expect(await jsonAdapter(running.url).call("process.list", {})).toMatchObject({
+        value: { processes: [{ name: "svc", status: "running" }] }
+      })
+    } finally {
+      await running.stop()
+      try {
+        process.kill(-victimPid, "SIGKILL")
+      } catch {
+        // already gone
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps no pids in the manifest once services exit or the server closes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-clear-"))
+    const manifest = async () =>
+      JSON.parse(await readFile(join(dir, ".sandbox/services.json"), "utf8")) as Array<
+        Record<string, unknown>
+      >
+    const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+    try {
+      const api = jsonAdapter(running.url)
+      await api.call("process.start", { name: "quick", command: "exit 3" })
+      await api.call("process.start", { name: "svc", command: "sleep 60" })
+      await until(async () => (await manifest()).find((s) => s.name === "quick")?.pid === undefined)
+      expect((await manifest()).find((s) => s.name === "svc")).toHaveProperty("pid")
+    } finally {
+      await running.stop()
+    }
+    try {
+      const entries = await manifest()
+      expect(entries.map((s) => s.name).sort()).toEqual(["quick", "svc"])
+      for (const entry of entries) {
+        expect(entry).not.toHaveProperty("pid")
+        expect(entry).not.toHaveProperty("pgid")
+        expect(entry).not.toHaveProperty("leader")
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
     }
   })
 })

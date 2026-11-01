@@ -7,9 +7,11 @@ import { Effect, Layer, Redacted, Schema } from "effect"
 import { CallCache, CallCacheLive } from "./call-cache.js"
 import { SandboxdConfig } from "./config.js"
 import { ToolError, statusOf } from "./errors.js"
-import { invoke } from "./registry.js"
+import { Presence, PresenceLive } from "./presence.js"
+import { ProcessesLive } from "./processes.js"
+import { type ToolRequirements, invoke } from "./registry.js"
 import { tools } from "./tools.js"
-import { Workspace, WorkspaceLive } from "./workspace.js"
+import { WorkspaceLive } from "./workspace.js"
 
 const byName = new Map(tools.map((tool) => [tool.name, tool]))
 const encodeToolError = Schema.encodeSync(ToolError)
@@ -42,7 +44,12 @@ const authenticate = (token: string) =>
 const JsonRoutes = HttpRouter.Default.use((router) =>
   Effect.gen(function* () {
     const cache = yield* CallCache
-    const workspace = yield* Workspace
+    const context = yield* Effect.context<ToolRequirements>()
+    const presence = yield* Presence
+    yield* router.get(
+      "/v1/presence",
+      Effect.flatMap(presence.snapshot, (snapshot) => HttpServerResponse.json(snapshot))
+    )
     yield* router.get(
       "/v1/tools",
       HttpServerResponse.json(tools.map(({ name, description }) => ({ name, description })))
@@ -66,7 +73,7 @@ const JsonRoutes = HttpRouter.Default.use((router) =>
           })
         }
         const result = yield* invoke(tool, input.right, cache).pipe(
-          Effect.provideService(Workspace, workspace),
+          Effect.provide(context),
           Effect.either
         )
         if (result._tag === "Left") {
@@ -104,17 +111,16 @@ const McpTools = Layer.provide(
   toolkit.toLayer(
     Effect.gen(function* () {
       const cache = yield* CallCache
-      const workspace = yield* Workspace
+      const context = yield* Effect.context<ToolRequirements>()
       return Object.fromEntries(
         tools.map((tool) => [
           tool.name,
-          (params: object) =>
-            invoke(tool, params, cache).pipe(Effect.provideService(Workspace, workspace))
+          (params: object) => invoke(tool, params, cache).pipe(Effect.provide(context))
         ])
       )
     }) as never
   )
-) as Layer.Layer<never, never, CallCache | Workspace>
+) as Layer.Layer<never, never, CallCache | ToolRequirements>
 
 /** Everything except the listening socket: provide an `HttpServer` and `SandboxdConfig` to run it. */
 export const SandboxdApp = Layer.unwrapEffect(
@@ -125,5 +131,12 @@ export const SandboxdApp = Layer.unwrapEffect(
   Layer.provide(JsonRoutes),
   Layer.provide(McpTools),
   Layer.provide(McpServer.layerHttp({ name: "sandboxd", version: "0.0.0", path: "/mcp" })),
-  Layer.provide(Layer.mergeAll(WorkspaceLive, CallCacheLive()))
+  Layer.provide(
+    Layer.mergeAll(
+      WorkspaceLive,
+      CallCacheLive(),
+      PresenceLive,
+      ProcessesLive.pipe(Layer.provide(WorkspaceLive))
+    )
+  )
 )
