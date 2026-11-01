@@ -106,27 +106,22 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const execFileAsync = promisify(execFile)
 
 /**
- * Start time plus command line of a live process, or undefined when it is gone or unreadable.
- * Start time tells a reused pid apart; Linux reads /proc, macOS asks ps.
+ * Pid plus start time of a live process, or undefined when it is gone or unreadable. The start time
+ * tells a reused pid apart and, unlike the command line, survives `exec`. Linux reads /proc, macOS
+ * asks ps.
  */
 export const leaderIdentity = async (pid: number): Promise<string | undefined> => {
   try {
+    let startTime: string | undefined
     if (existsSync("/proc/self/stat")) {
       const stat = await readFile(`/proc/${pid}/stat`, "utf8")
       // Field 22 is the start time; the command name in field 2 may contain spaces, so count after ")".
-      const startTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]
-      const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8")
-      return startTime === undefined ? undefined : `${startTime} ${cmdline.replaceAll("\0", " ")}`
+      startTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]
+    } else {
+      const { stdout } = await execFileAsync("ps", ["-o", "lstart=", "-p", `${pid}`])
+      startTime = stdout.trim()
     }
-    const { stdout } = await execFileAsync("ps", [
-      "-o",
-      "lstart=",
-      "-o",
-      "command=",
-      "-p",
-      `${pid}`
-    ])
-    return stdout.trim() === "" ? undefined : stdout.trim()
+    return startTime === undefined || startTime === "" ? undefined : `${pid} ${startTime}`
   } catch {
     return undefined
   }
@@ -223,9 +218,7 @@ export const ProcessesLive = Layer.scoped(
             const fd = openSync(log, "a")
             try {
               // Detached with output in a file: the service outlives this call and its pipes.
-              // The trailing `exit` stops sh from exec'ing the last command, so the leader's command
-              // line, part of its recorded identity, stays the same for its whole life.
-              return spawn("sh", ["-c", `${spec.command}\nexit $?`], {
+              return spawn("sh", ["-c", spec.command], {
                 cwd,
                 env: { ...childEnv(), ...spec.env },
                 detached: true,

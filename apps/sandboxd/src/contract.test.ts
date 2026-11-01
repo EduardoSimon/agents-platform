@@ -479,16 +479,15 @@ describe("restart", () => {
     }
   })
 
-  it("kills a service left behind by a crashed daemon before starting it again", async () => {
+  it.each([
+    ["a plain command", "echo boot >> boots.txt; sleep 60"],
+    // The leader execs into another program after its identity is recorded.
+    ["an exec command", "echo boot >> boots.txt; sleep 0.2; exec sleep 60"]
+  ])("kills a service left behind by a crashed daemon running %s", async (_, command) => {
     const dir = await mkdtemp(join(tmpdir(), "sandboxd-crash-"))
-    const command = "echo boot >> boots.txt; sleep 60"
     // What a SIGKILLed daemon leaves behind: a detached group still running, recorded in the manifest
     // with its leader's identity. Spawned the way sandboxd spawns services.
-    const orphan = spawn("sh", ["-c", `${command}\nexit $?`], {
-      cwd: dir,
-      detached: true,
-      stdio: "ignore"
-    })
+    const orphan = spawn("sh", ["-c", command], { cwd: dir, detached: true, stdio: "ignore" })
     orphan.unref()
     const oldPid = orphan.pid as number
     const leader = await leaderIdentity(oldPid)
@@ -501,6 +500,7 @@ describe("restart", () => {
       ])
     )
     await until(async () => (await readFile(join(dir, "boots.txt"), "utf8").catch(() => "")) !== "")
+    await new Promise((resolve) => setTimeout(resolve, 500))
     const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
     try {
       const api = jsonAdapter(running.url)
@@ -511,6 +511,12 @@ describe("restart", () => {
       expect(listed.value.processes).toMatchObject([{ name: "svc", status: "running" }])
       const newPid = listed.value.processes[0]?.pid as number
       expect(newPid).not.toBe(oldPid)
+      // Exactly one copy: the orphan's group is gone and only the relaunched one runs.
+      expect(groupAlive(oldPid)).toBe(false)
+      expect(groupAlive(newPid)).toBe(true)
+      await until(
+        async () => (await readFile(join(dir, "boots.txt"), "utf8")).split("\n").length === 3
+      )
       const manifest = JSON.parse(await readFile(join(dir, ".sandbox/services.json"), "utf8"))
       expect(manifest).toMatchObject([
         { name: "svc", pid: newPid, pgid: newPid, leader: await leaderIdentity(newPid) }
