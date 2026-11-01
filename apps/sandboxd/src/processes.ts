@@ -1,8 +1,9 @@
-import { type ChildProcess, spawn } from "node:child_process"
-import { closeSync, openSync } from "node:fs"
+import { type ChildProcess, execFile, spawn } from "node:child_process"
+import { closeSync, existsSync, openSync } from "node:fs"
 import { mkdir, open, readFile, rename, writeFile } from "node:fs/promises"
 import { constants } from "node:os"
 import { join } from "node:path"
+import { promisify } from "node:util"
 import { Context, Effect, Layer, Option, Schema } from "effect"
 import { ProcessAlreadyRunning, ProcessNotFound, type ToolError, ToolIoError } from "./errors.js"
 import { childEnv } from "./process.js"
@@ -27,7 +28,9 @@ export type ServiceSpec = typeof ServiceSpec.Type
 const ManifestEntry = Schema.Struct({
   ...ServiceSpec.fields,
   pid: Schema.optional(Schema.Int),
-  pgid: Schema.optional(Schema.Int)
+  pgid: Schema.optional(Schema.Int),
+  /** Identity of the group leader (see `leaderIdentity`), checked before boot kills the group. */
+  leader: Schema.optional(Schema.String)
 })
 
 export const ProcessInfo = Schema.Struct({
@@ -67,6 +70,7 @@ interface Entry {
   pid?: number
   exitCode?: number
   error?: string
+  leader?: string
   child?: ChildProcess
   /** Settles when the shell exits or fails to spawn. */
   done: Promise<void>
@@ -98,6 +102,35 @@ const killGroup = (entry: Entry, signal: NodeJS.Signals) => {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+const execFileAsync = promisify(execFile)
+
+/**
+ * Start time plus command line of a live process, or undefined when it is gone or unreadable.
+ * Start time tells a reused pid apart; Linux reads /proc, macOS asks ps.
+ */
+export const leaderIdentity = async (pid: number): Promise<string | undefined> => {
+  try {
+    if (existsSync("/proc/self/stat")) {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8")
+      // Field 22 is the start time; the command name in field 2 may contain spaces, so count after ")".
+      const startTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]
+      const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8")
+      return startTime === undefined ? undefined : `${startTime} ${cmdline.replaceAll("\0", " ")}`
+    }
+    const { stdout } = await execFileAsync("ps", [
+      "-o",
+      "lstart=",
+      "-o",
+      "command=",
+      "-p",
+      `${pid}`
+    ])
+    return stdout.trim() === "" ? undefined : stdout.trim()
+  } catch {
+    return undefined
+  }
+}
 
 /**
  * Kill a group a previous daemon left running (it crashed before stopping it). It is not our child,
@@ -142,6 +175,13 @@ export const ProcessesLive = Layer.scoped(
     const logPath = (name: string) => join(sandboxDir, "logs", `${name}.log`)
     const entries = new Map<string, Entry>()
     const lock = yield* Effect.makeSemaphore(1)
+    let closing = false
+    // Manifest writes started from exit callbacks, awaited before the layer closes.
+    const writes = new Set<Promise<void>>()
+    const track = (write: Promise<void>) => {
+      writes.add(write)
+      void write.finally(() => writes.delete(write))
+    }
 
     const io = <A>(label: string, run: () => Promise<A>) =>
       Effect.tryPromise({
@@ -154,9 +194,12 @@ export const ProcessesLive = Layer.scoped(
 
     /** Atomic: write a sibling temp file, then rename over the manifest. */
     const persist = io("services manifest", async () => {
-      // The pid is also the pgid: services are spawned detached, as their own group leader.
-      const specs = [...entries.values()].map(({ spec, pid }) =>
-        pid === undefined ? spec : { ...spec, pid, pgid: pid }
+      // Only a running service keeps its pid. The pid is also the pgid: services are spawned
+      // detached, as their own group leader.
+      const specs = [...entries.values()].map(({ spec, status, pid, leader }) =>
+        status !== "running" || pid === undefined
+          ? spec
+          : { ...spec, pid, pgid: pid, ...(leader === undefined ? {} : { leader }) }
       )
       await mkdir(sandboxDir, { recursive: true })
       const temp = `${manifestPath}.${process.pid}.tmp`
@@ -180,7 +223,9 @@ export const ProcessesLive = Layer.scoped(
             const fd = openSync(log, "a")
             try {
               // Detached with output in a file: the service outlives this call and its pipes.
-              return spawn("sh", ["-c", spec.command], {
+              // The trailing `exit` stops sh from exec'ing the last command, so the leader's command
+              // line, part of its recorded identity, stays the same for its whole life.
+              return spawn("sh", ["-c", `${spec.command}\nexit $?`], {
                 cwd,
                 env: { ...childEnv(), ...spec.env },
                 detached: true,
@@ -195,6 +240,7 @@ export const ProcessesLive = Layer.scoped(
         })
         entry.child = child
         if (child.pid !== undefined) entry.pid = child.pid
+        // Listen before anything async, or a quick exit is missed.
         entry.done = new Promise<void>((resolve) => {
           child.once("error", (error) => {
             entry.status = "failed"
@@ -205,9 +251,15 @@ export const ProcessesLive = Layer.scoped(
             if (entry.status === "running") entry.status = "exited"
             entry.exitCode = exitCodeOf(code, signal)
             resolve()
+            // Its pid is free for reuse now: drop it from the manifest.
+            if (!closing) track(Effect.runPromise(lock.withPermits(1)(persist).pipe(Effect.ignore)))
           })
         })
         child.unref()
+        if (entry.pid !== undefined) {
+          const leader = yield* Effect.promise(() => leaderIdentity(entry.pid as number))
+          if (leader !== undefined) entry.leader = leader
+        }
         return entry
       })
 
@@ -216,9 +268,14 @@ export const ProcessesLive = Layer.scoped(
       Effect.map((text) => decodeManifest(safeJson(text))),
       Effect.orElseSucceed(() => Option.none<ReadonlyArray<typeof ManifestEntry.Type>>())
     )
-    for (const { pid: _pid, pgid, ...spec } of Option.getOrElse(manifest, () => [])) {
-      // After a crash the old group is still running: kill it so only the relaunched copy is left.
-      if (pgid !== undefined) yield* Effect.promise(() => reapOrphan(pgid))
+    for (const { pid: _pid, pgid, leader, ...spec } of Option.getOrElse(manifest, () => [])) {
+      // Only a crash leaves a pgid behind, and its group may still be running: kill it so only the
+      // relaunched copy is left. Skip it unless the live leader is provably the one recorded, since
+      // the pgid may now belong to an unrelated group.
+      if (pgid !== undefined && leader !== undefined) {
+        const live = yield* Effect.promise(() => leaderIdentity(pgid))
+        if (live === leader) yield* Effect.promise(() => reapOrphan(pgid))
+      }
       const entry = yield* launch(spec).pipe(
         Effect.catchAll((error) =>
           Effect.succeed<Entry>({
@@ -235,9 +292,15 @@ export const ProcessesLive = Layer.scoped(
     // Record the new pids, so a later crash can be cleaned up too.
     if (entries.size > 0) yield* persist.pipe(Effect.ignore)
 
-    // Closing the server layer stops the children but keeps the manifest, so the next boot restores them.
+    // Closing the server layer stops the children but keeps the manifest, so the next boot restores
+    // them. Their pids are dropped, so the next boot has nothing to kill.
     yield* Effect.addFinalizer(() =>
-      Effect.promise(() => Promise.all([...entries.values()].map(terminate)))
+      Effect.gen(function* () {
+        closing = true
+        yield* Effect.promise(() => Promise.all([...entries.values()].map(terminate)))
+        yield* Effect.promise(() => Promise.all(writes))
+        if (entries.size > 0) yield* lock.withPermits(1)(persist).pipe(Effect.ignore)
+      })
     )
 
     const start = (spec: ServiceSpec) =>

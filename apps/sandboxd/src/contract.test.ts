@@ -6,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { leaderIdentity } from "./processes.js"
 import { type RunningServer, startServer } from "./testing.js"
 
 const TOKEN = "test-token"
@@ -481,14 +482,23 @@ describe("restart", () => {
   it("kills a service left behind by a crashed daemon before starting it again", async () => {
     const dir = await mkdtemp(join(tmpdir(), "sandboxd-crash-"))
     const command = "echo boot >> boots.txt; sleep 60"
-    // What a SIGKILLed daemon leaves behind: a detached group still running, recorded in the manifest.
-    const orphan = spawn("sh", ["-c", command], { cwd: dir, detached: true, stdio: "ignore" })
+    // What a SIGKILLed daemon leaves behind: a detached group still running, recorded in the manifest
+    // with its leader's identity. Spawned the way sandboxd spawns services.
+    const orphan = spawn("sh", ["-c", `${command}\nexit $?`], {
+      cwd: dir,
+      detached: true,
+      stdio: "ignore"
+    })
     orphan.unref()
     const oldPid = orphan.pid as number
+    const leader = await leaderIdentity(oldPid)
+    expect(leader).toBeDefined()
     await mkdir(join(dir, ".sandbox"), { recursive: true })
     await writeFile(
       join(dir, ".sandbox/services.json"),
-      JSON.stringify([{ name: "svc", command, cwd: ".", env: {}, pid: oldPid, pgid: oldPid }])
+      JSON.stringify([
+        { name: "svc", command, cwd: ".", env: {}, pid: oldPid, pgid: oldPid, leader }
+      ])
     )
     await until(async () => (await readFile(join(dir, "boots.txt"), "utf8").catch(() => "")) !== "")
     const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
@@ -502,7 +512,9 @@ describe("restart", () => {
       const newPid = listed.value.processes[0]?.pid as number
       expect(newPid).not.toBe(oldPid)
       const manifest = JSON.parse(await readFile(join(dir, ".sandbox/services.json"), "utf8"))
-      expect(manifest).toMatchObject([{ name: "svc", pid: newPid, pgid: newPid }])
+      expect(manifest).toMatchObject([
+        { name: "svc", pid: newPid, pgid: newPid, leader: await leaderIdentity(newPid) }
+      ])
       expect(await api.call("process.stop", { name: "svc" })).toMatchObject({ ok: true })
       expect(isAlive(oldPid)).toBe(false)
       expect(isAlive(newPid)).toBe(false)
@@ -515,6 +527,73 @@ describe("restart", () => {
         // already gone
       }
       await running.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("leaves alone an unrelated group that now holds the recorded pgid", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-reuse-"))
+    // The recorded group died and the OS gave its pgid to an unrelated group leader.
+    const victim = spawn("sleep", ["60"], { detached: true, stdio: "ignore" })
+    victim.unref()
+    const victimPid = victim.pid as number
+    await mkdir(join(dir, ".sandbox"), { recursive: true })
+    await writeFile(
+      join(dir, ".sandbox/services.json"),
+      JSON.stringify([
+        {
+          name: "svc",
+          command: "sleep 60",
+          cwd: ".",
+          env: {},
+          pid: victimPid,
+          pgid: victimPid,
+          leader: "a leader that no longer exists"
+        }
+      ])
+    )
+    const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+    try {
+      expect(groupAlive(victimPid)).toBe(true)
+      expect(await jsonAdapter(running.url).call("process.list", {})).toMatchObject({
+        value: { processes: [{ name: "svc", status: "running" }] }
+      })
+    } finally {
+      await running.stop()
+      try {
+        process.kill(-victimPid, "SIGKILL")
+      } catch {
+        // already gone
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps no pids in the manifest once services exit or the server closes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sandboxd-clear-"))
+    const manifest = async () =>
+      JSON.parse(await readFile(join(dir, ".sandbox/services.json"), "utf8")) as Array<
+        Record<string, unknown>
+      >
+    const running = await startServer({ token: TOKEN, workspaceDir: dir, port: 0 })
+    try {
+      const api = jsonAdapter(running.url)
+      await api.call("process.start", { name: "quick", command: "exit 3" })
+      await api.call("process.start", { name: "svc", command: "sleep 60" })
+      await until(async () => (await manifest()).find((s) => s.name === "quick")?.pid === undefined)
+      expect((await manifest()).find((s) => s.name === "svc")).toHaveProperty("pid")
+    } finally {
+      await running.stop()
+    }
+    try {
+      const entries = await manifest()
+      expect(entries.map((s) => s.name).sort()).toEqual(["quick", "svc"])
+      for (const entry of entries) {
+        expect(entry).not.toHaveProperty("pid")
+        expect(entry).not.toHaveProperty("pgid")
+        expect(entry).not.toHaveProperty("leader")
+      }
+    } finally {
       await rm(dir, { recursive: true, force: true })
     }
   })
