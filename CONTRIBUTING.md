@@ -38,3 +38,5 @@ mise run check
 - **New packages:** copy `packages/sample`. Its `exports` use an `@agents-platform/source` condition (`src/index.ts`), with `dist` as the default, so tests and types work on a clean clone without a build.
 - **Go:** one module, `apps/egress`, run with `go -C apps/egress …`. There is no `go.work`. `GOTOOLCHAIN=local` keeps the mise pin as the only Go version.
 - **Examples:** `examples/*` are standalone projects with their own lockfiles and are not part of `check`.
+- **Tool inputs:** a tool input that ends up in a file path or command uses a validated schema (like `ProcessName`), never `Schema.String`. Add a contract case on both transports that a `../` value is rejected.
+- **Recorded pids:** never signal a pid or pgid read from disk unless its identity (pid + process start time, not the command line) still matches. Clear recorded pids when the process exits or the layer closes. Tests that start processes stop them in `finally`.
